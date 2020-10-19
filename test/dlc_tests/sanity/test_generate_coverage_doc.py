@@ -6,29 +6,16 @@ import pytest
 from botocore.exceptions import ClientError
 from invoke.context import Context
 
-from test.test_utils import is_pr_context, is_canary_context, LOGGER
+from test.test_utils import LOGGER, is_mainline_context
 from test.test_utils.test_reporting import get_test_coverage_file_path
 
 
-TEST_COVERAGE_REPORT_REGION = "us-west-2"
-TEST_COVERAGE_REPORT_BUCKET = f"dlc-test-coverage-reports-{TEST_COVERAGE_REPORT_REGION}"
+ACCOUNT_ID = os.getenv("ACCOUNT_ID", boto3.client("sts").get_caller_identity().get("Account"))
+TEST_COVERAGE_REPORT_BUCKET = f"dlc-test-coverage-reports-{ACCOUNT_ID}"
 
 
-def coverage_doc_skip_condition():
-    # Run this only in us-west-2
-    if is_canary_context() and os.getenv("AWS_REGION") == TEST_COVERAGE_REPORT_REGION:
-        return False
-    elif is_pr_context():
-        return False
-    return True
-
-
-@pytest.mark.skipif(
-    coverage_doc_skip_condition(), reason=f"Run only in PR context or {TEST_COVERAGE_REPORT_REGION} canary context"
-)
 @pytest.mark.integration("Generating this coverage doc")
 @pytest.mark.model("N/A")
-@pytest.mark.canary(f"runs only in {TEST_COVERAGE_REPORT_REGION}")
 def test_generate_coverage_doc():
     """
     Test generating the test coverage doc
@@ -47,13 +34,12 @@ def test_generate_coverage_doc():
     assert os.path.exists(test_coverage_file), f"Cannot find test coverage report file {test_coverage_file}"
 
     # Write test coverage file to S3
-    report_region = TEST_COVERAGE_REPORT_REGION
-    report_bucket = TEST_COVERAGE_REPORT_BUCKET
-    if is_canary_context() and os.getenv("AWS_REGION") == report_region:
+    if is_mainline_context():
         client = boto3.client("s3")
         with open(test_coverage_file, "rb") as test_file:
             try:
-                client.put_object(Bucket=report_bucket, Key=os.path.basename(test_coverage_file), Body=test_file)
+                client.put_object(Bucket=TEST_COVERAGE_REPORT_BUCKET, Key=os.path.basename(test_coverage_file),
+                                  Body=test_file)
             except ClientError as e:
-                LOGGER.error(f"Unable to upload report to bucket {report_bucket}. Error: {e}")
+                LOGGER.error(f"Unable to upload report to bucket {TEST_COVERAGE_REPORT_BUCKET}. Error: {e}")
                 raise

@@ -7,9 +7,10 @@ pytest-cov
 pytest-rerunfailures==9.0
 pytest-xdist
 mock
-sagemaker
+sagemaker<2
 docker-compose
-mxnet==1.4.0
+mxnet==1.7.0.post1
 awslogs
 requests_mock
 fabric
+gitpython

@@ -3,13 +3,14 @@ import os
 import subprocess
 import random
 import re
-
 from time import sleep
 
 from invoke.context import Context
 from invoke import exceptions
+from junit_xml import TestSuite, TestCase
 
 from test_utils import ec2 as ec2_utils
+from test_utils import metrics as metrics_utils
 from test_utils import (
     destroy_ssh_keypair,
     generate_ssh_keypair,
@@ -25,6 +26,10 @@ from test_utils import (
     UBUNTU_HOME_DIR,
     DEFAULT_REGION
 )
+
+
+class DLCSageMakerRemoteTestFailure(Exception):
+    pass
 
 
 def assign_sagemaker_remote_job_instance_type(image):
@@ -57,6 +62,8 @@ def launch_sagemaker_local_ec2_instance(image, ami_id, ec2_key_name, region):
         region=region,
         ec2_key_name=ec2_key_name,
         instance_type=instance_type,
+        # EIA does not have SM Local test
+        ei_accelerator_type=None,
         user_data=None,
         iam_instance_profile_name=ec2_utils.EC2_INSTANCE_ROLE_NAME,
         instance_name=f"sm-local-{instance_name}",
@@ -64,9 +71,7 @@ def launch_sagemaker_local_ec2_instance(image, ami_id, ec2_key_name, region):
     instance_id = instance["InstanceId"]
     public_ip_address = ec2_utils.get_public_ip(instance_id, region=region)
     ec2_utils.check_instance_state(instance_id, state="running", region=region)
-    ec2_utils.check_system_state(
-        instance_id, system_status="ok", instance_status="ok", region=region
-    )
+    ec2_utils.check_system_state(instance_id, system_status="ok", instance_status="ok", region=region)
     return instance_id, public_ip_address
 
 
@@ -97,9 +102,11 @@ def generate_sagemaker_pytest_cmd(image, sagemaker_test_type):
     aws_id_arg = "--aws-id"
     docker_base_arg = "--docker-base-name"
     instance_type_arg = "--instance-type"
+    accelerator_type_arg = "--accelerator-type"
+    eia_arg = "ml.eia1.large"
     framework_version = re.search(r"\d+(\.\d+){2}", tag).group()
     framework_major_version = framework_version.split(".")[0]
-    processor = "gpu" if "gpu" in image else "cpu"
+    processor = "gpu" if "gpu" in image else "eia" if "eia" in image else "cpu"
     py_version = re.search(r"py\d+", tag).group()
     sm_local_py_version = "37" if py_version == "py37" else "2" if py_version == "py27" else "3"
     if framework == "tensorflow" and job_type == "inference":
@@ -113,19 +120,24 @@ def generate_sagemaker_pytest_cmd(image, sagemaker_test_type):
         if job_type == "inference":
             aws_id_arg = "--registry"
             docker_base_arg = "--repo"
-            integration_path = os.path.join(integration_path, "test_tfs.py")
             instance_type_arg = "--instance-types"
+            integration_path = os.path.join(integration_path, "test_tfs.py") if processor != "eia" else os.path.join(integration_path, "test_ei.py")
 
-    if framework == "tensorflow" and job_type == 'training':
+    if framework == "tensorflow" and job_type == "training":
         aws_id_arg = "--account-id"
 
-    test_report = os.path.join(os.getcwd(), "test", f"{tag}.xml")
+    test_report = os.path.join(os.getcwd(), "test", f"{job_type}_{tag}.xml")
     local_test_report = os.path.join(UBUNTU_HOME_DIR, "test", f"{job_type}_{tag}_sm_local.xml")
     is_py3 = " python3 -m "
 
-    remote_pytest_cmd = (f"pytest {integration_path} --region {region} {docker_base_arg} "
-                         f"{sm_remote_docker_base_name} --tag {tag} {aws_id_arg} {account_id} "
-                         f"{instance_type_arg} {instance_type} --junitxml {test_report}")
+    remote_pytest_cmd = (
+        f"pytest {integration_path} --region {region} {docker_base_arg} "
+        f"{sm_remote_docker_base_name} --tag {tag} {aws_id_arg} {account_id} "
+        f"{instance_type_arg} {instance_type} --junitxml {test_report}"
+    )
+
+    if processor == "eia" :
+        remote_pytest_cmd += (f" {accelerator_type_arg} {eia_arg}")
 
     local_pytest_cmd = (f"{is_py3} pytest -v {integration_path} {docker_base_arg} "
                         f"{sm_local_docker_repo_uri} --tag {tag} --framework-version {framework_version} "
@@ -140,7 +152,7 @@ def generate_sagemaker_pytest_cmd(image, sagemaker_test_type):
         remote_pytest_cmd if sagemaker_test_type == SAGEMAKER_REMOTE_TEST_TYPE else local_pytest_cmd,
         path,
         tag,
-        job_type
+        job_type,
     )
 
 
@@ -169,15 +181,11 @@ def install_sm_local_dependencies(framework, job_type, image, ec2_conn):
     """
     # Install custom packages which need to be latest version"
     is_py3 = " python3 -m"
-    # To avoid the dpkg lock with apt-daily service if exists
-    sleep(200)
     # using virtualenv to avoid package conflicts with the current packages
     ec2_conn.run(f"sudo apt-get install virtualenv -y ")
     if framework == "tensorflow" and job_type == "inference":
         # TF inference test fail if run as soon as instance boots, even after health check pass. rootcause:
         # sockets?/nginx startup?/?
-        print("sleep 300s for tensorflow inference images to avoid socket issues")
-        sleep(300)
         install_custom_python("3.6", ec2_conn)
     ec2_conn.run(f"virtualenv env")
     ec2_conn.run(f"source ./env/bin/activate")
@@ -185,6 +193,42 @@ def install_sm_local_dependencies(framework, job_type, image, ec2_conn):
         # The following distutils package conflict with test dependencies
         ec2_conn.run("sudo apt-get remove python3-scipy python3-yaml -y")
     ec2_conn.run(f"sudo {is_py3} pip install -r requirements.txt ", warn=True)
+
+
+def kill_background_processes_and_run_apt_get_update(ec2_conn):
+    """
+    The apt-daily services on the DLAMI cause a conflict upon running any "apt install" commands within the first few
+    minutes of starting an EC2 instance. These services are not necessary for the purpose of the DLC tests, and can
+    therefore be killed. This function kills the services, and then forces "apt-get update" to run in the foreground.
+
+    :param ec2_conn: Fabric SSH connection
+    :return:
+    """
+    apt_daily_services_list = ["apt-daily.service", "apt-daily-upgrade.service", "unattended-upgrades.service"]
+    apt_daily_services = " ".join(apt_daily_services_list)
+    ec2_conn.run(f"sudo systemctl stop {apt_daily_services}")
+    ec2_conn.run(f"sudo systemctl kill --kill-who=all {apt_daily_services}")
+    num_stopped_services = 0
+    # The `systemctl kill` command is expected to take about 1 second. The 60 second loop here exists to force
+    # the execution to wait (if needed) for a longer amount of time than it would normally take to kill the services.
+    for _ in range(60):
+        sleep(1)
+        # List the apt-daily services, get the number of dead services
+        num_stopped_services = int(ec2_conn.run(
+            f"systemctl list-units --all {apt_daily_services} | egrep '(dead|failed)' | wc -l"
+        ).stdout.strip())
+        # Exit condition for the loop is when all apt daily services are dead.
+        if num_stopped_services == len(apt_daily_services_list):
+            break
+    if num_stopped_services != len(apt_daily_services_list):
+        raise RuntimeError(
+            "Failed to kill background services to allow apt installs on SM Local EC2 instance. "
+            f"{len(apt_daily_services) - num_stopped_services} still remaining."
+        )
+    ec2_conn.run("sudo rm -rf /var/lib/dpkg/lock*;")
+    ec2_conn.run("sudo dpkg --configure -a;")
+    ec2_conn.run("sudo apt-get update")
+    return
 
 
 def execute_local_tests(image, ec2_client):
@@ -216,6 +260,7 @@ def execute_local_tests(image, ec2_client):
         ec2_conn.run(f"$(aws ecr get-login --no-include-email --region {region})")
         ec2_conn.run(f"docker pull {image}")
         ec2_conn.run(f"tar -xzf {sm_tests_tar_name}")
+        kill_background_processes_and_run_apt_get_update(ec2_conn)
         with ec2_conn.cd(path):
             install_sm_local_dependencies(framework, job_type, image, ec2_conn)
             # Workaround for mxnet cpu training images as test distributed
@@ -249,9 +294,7 @@ def execute_local_tests(image, ec2_client):
 def execute_sagemaker_remote_tests(image):
     """
     Run pytest in a virtual env for a particular image
-
     Expected to run via multiprocessing
-
     :param image: ECR url
     """
     pytest_command, path, tag, job_type = generate_sagemaker_pytest_cmd(image, SAGEMAKER_REMOTE_TEST_TYPE)
@@ -260,4 +303,22 @@ def execute_sagemaker_remote_tests(image):
         context.run(f"virtualenv {tag}")
         with context.prefix(f"source {tag}/bin/activate"):
             context.run("pip install -r requirements.txt", warn=True)
-            context.run(pytest_command)
+            res = context.run(pytest_command, warn=True)
+            metrics_utils.send_test_result_metrics(res.return_code)
+            if res.failed:
+                raise DLCSageMakerRemoteTestFailure(
+                    f"{pytest_command} failed with error code: {res.return_code}\n"
+                    f"Traceback:\n{res.stdout}"
+                )
+
+
+def generate_empty_report(report, test_type, case):
+    """
+    Generate empty junitxml report if no tests are run
+    :param report: CodeBuild Report
+    Returns: None
+    """
+    test_cases = [TestCase(test_type, case, 1, f"Skipped {test_type} on {case}", '')]
+    ts = TestSuite(report, test_cases)
+    with open(report, "w") as skip_file:
+        TestSuite.to_file(skip_file, [ts], prettyprint=False)
